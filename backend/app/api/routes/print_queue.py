@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import zipfile
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -65,6 +66,11 @@ from backend.app.schemas.print_queue import (
     PrintQueueItemResponse,
     PrintQueueItemUpdate,
     PrintQueueReorder,
+    QueueFitJob,
+    QueueFitPrinter,
+    QueueFitResponse,
+    QueueFitSubstitution,
+    QueueTodoFilament,
     QueueTodoResponse,
     QueueVariantCreate,
     QueueVariantSummary,
@@ -1089,6 +1095,107 @@ async def queue_todo(
         plate_changer_empty,
         {row.id: row.model for row in printer_rows},
     )
+
+
+# Order of a job's printers in GET /queue/fit: what could start now first,
+# then by how much loading it would take, with nothing to judge by last.
+_FIT_ORDER = {"fits": 0, "short": 1, "unmatched": 2, "unknown": 3}
+
+
+@router.get("/fit", response_model=QueueFitResponse)
+async def queue_fit(
+    db: AsyncSession = Depends(get_db, scope="function"),
+    auth_result: tuple[User | ApiKeyActor | None, bool] = Depends(
+        require_ownership_permission(
+            Permission.QUEUE_READ_ALL,
+            Permission.QUEUE_READ_OWN,
+        )
+    ),
+    printer_scope: PrinterScope = RequestPrinterScope,
+):
+    """How each pending job fits the filament its printers have loaded now.
+
+    For every pending job the caller may see, every printer it could go to
+    (its pinned printer, or each active printer of its model and location its
+    creator may use) with the verdict the scheduler would reach on what is
+    loaded: fits, unmatched, short or unknown. Read-only; see
+    ``services/filament_fit.py``.
+    """
+    from backend.app.services.filament_fit import PrinterFit, fit_on_printer
+    from backend.app.services.print_scheduler import _could_take_printer, scheduler as _scheduler
+
+    user, can_read_all = auth_result
+    query = (
+        select(PrintQueueItem)
+        .options(
+            selectinload(PrintQueueItem.archive),
+            selectinload(PrintQueueItem.library_file),
+            selectinload(PrintQueueItem.variants).selectinload(PrintQueueVariant.library_file),
+        )
+        .where(PrintQueueItem.status == "pending")
+        .order_by(PrintQueueItem.position, PrintQueueItem.id)
+    )
+    if user is not None and not can_read_all:
+        query = query.where(PrintQueueItem.created_by_id == user.id)
+    if (clause := printer_scope.where(PrintQueueItem.printer_id)) is not None:
+        query = query.where(clause)
+    items = list((await db.execute(query)).scalars().all())
+
+    printer_query = select(Printer.id, Printer.name, Printer.model, Printer.location, Printer.is_active)
+    if (clause := printer_scope.where_strict(Printer.id)) is not None:
+        printer_query = printer_query.where(clause)
+    printer_rows = (await db.execute(printer_query)).all()
+    printers_by_id = {row.id: row for row in printer_rows}
+
+    creator_scopes: dict[int | None, PrinterScope] = {}
+    jobs: list[QueueFitJob] = []
+    for item in items:
+        if item.printer_id is not None:
+            if item.printer_id not in printers_by_id:
+                continue
+            candidates = [printers_by_id[item.printer_id]]
+        else:
+            if item.created_by_id not in creator_scopes:
+                creator_scopes[item.created_by_id] = await _scheduler._creator_printer_scope(db, item.created_by_id)
+            creator_scope = creator_scopes[item.created_by_id]
+            candidates = [
+                row
+                for row in printer_rows
+                if row.is_active
+                and creator_scope.allows(row.id)
+                and _could_take_printer(item, row.id, row.model)
+                and (not item.target_location or row.location == item.target_location)
+            ]
+
+        fits: list[tuple[PrinterFit, str]] = []
+        for row in candidates:
+            fit = await fit_on_printer(db, item, row.id, _scheduler, printer_model=row.model)
+            fits.append((fit, row.name or f"printer {row.id}"))
+        fits.sort(key=lambda pair: (_FIT_ORDER[pair[0].status], not pair[0].idle, pair[0].swaps_needed))
+
+        jobs.append(
+            QueueFitJob(
+                id=item.id,
+                name=_queue_item_display_name(item),
+                printer_id=item.printer_id,
+                target_model=item.target_model,
+                printers=[
+                    QueueFitPrinter(
+                        printer_id=fit.printer_id,
+                        printer_name=name,
+                        status=fit.status,
+                        online=fit.online,
+                        idle=fit.idle,
+                        swaps_needed=fit.swaps_needed,
+                        unmatched=[QueueTodoFilament.model_validate(asdict(f)) for f in fit.unmatched],
+                        short=[QueueTodoFilament.model_validate(asdict(f)) for f in fit.short],
+                        color_substitutions=[QueueFitSubstitution.model_validate(s) for s in fit.color_substitutions],
+                    )
+                    for fit, name in fits
+                ],
+            )
+        )
+    return QueueFitResponse(jobs=jobs)
 
 
 HISTORY_STATUSES = ("completed", "failed", "skipped", "cancelled")
