@@ -665,3 +665,44 @@ class QueueTodoGroup(BaseModel):
 class QueueTodoResponse(BaseModel):
     count: int
     groups: list[QueueTodoGroup]
+
+
+class QueueFitSubstitution(BaseModel):
+    """A slot that would print in another colour of the same material (#3279)."""
+
+    slot_id: int
+    type: str
+    wanted: str
+    got: str
+    tray: int
+
+
+class QueueFitPrinter(BaseModel):
+    """How one pending job fits one printer's loaded filament right now."""
+
+    printer_id: int
+    printer_name: str
+    # fits | unmatched (a slot has no tray) | short (a spool holds too little) | unknown
+    status: Literal["fits", "unmatched", "short", "unknown"]
+    online: bool = False
+    # Online and not printing: the job could start here now if it fits.
+    idle: bool = False
+    # Spools someone would have to load or replace before the job fits.
+    swaps_needed: int = 0
+    unmatched: list[QueueTodoFilament] = []
+    short: list[QueueTodoFilament] = []
+    color_substitutions: list[QueueFitSubstitution] = []
+
+
+class QueueFitJob(BaseModel):
+    id: int
+    name: str
+    # The pinned printer, None for a job for any printer of a model.
+    printer_id: int | None = None
+    target_model: str | None = None
+    # Every printer the job could go to that the caller may see, best fit first.
+    printers: list[QueueFitPrinter]
+
+
+class QueueFitResponse(BaseModel):
+    jobs: list[QueueFitJob]
